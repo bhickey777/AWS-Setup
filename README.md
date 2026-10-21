@@ -1,4 +1,4 @@
-# Amazon Setup
+#AWS Setup
 
 Materials for the Hello World Wealth / PaySprint Wealth AWS lab: how the class AWS account is set up, how each service is built by hand, and the Jenkins pipeline that deploys student apps.
 
