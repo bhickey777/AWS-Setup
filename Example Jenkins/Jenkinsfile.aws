@@ -1,0 +1,256 @@
+// Student-owned CI/CD pipeline: ECR, ECS service deployment, S3/CloudFront, health checks. No SonarQube, unit tests, or docker-compose.
+// The Jenkins job should be restricted to this team's AWS deployment role.
+pipeline {
+  agent any
+  options { disableConcurrentBuilds(); timestamps(); timeout(time: 90, unit: 'MINUTES') }
+  environment {
+    TEAM_ID = 'team5'
+    AWS_ACCOUNT_ID = '760144414473'
+    AWS_DEPLOY_ROLE = 'leap-team5-deploy'
+    AWS_REGION = 'ca-central-1'
+    STACK_NAME = 'leap-team5'
+    // Adjust these paths to match your repository layout.
+    ORDERS_CONTEXT = 'hello-world-svc'
+    AUTH_CONTEXT = 'hello-world-auth'
+    HOLDINGS_CONTEXT = 'hello-world-holdings'
+    REPORTING_CONTEXT = 'hello-world-rpt-svc'
+    ANGULAR_APP_PATH = 'hello-world'
+    ANGULAR_DIST_PATH = 'hello-world/dist/hello-world/browser'
+    ADMIN_APP_PATH = 'hello-world-rpt'
+    ADMIN_DIST_PATH = 'hello-world-rpt/dist/hello-world-rpt/browser'
+    ROUTE_TESTS = 'orders|/api/orders/health|200,401 auth|/api/auth/health|200,401 holdings|/api/holdings/health|200,401 reporting|/api/reporting/health|200,401'
+  }
+  tools {
+        nodejs 'NodeJS'
+  }
+  stages {
+    stage('Checkout') { steps { checkout scm } }
+    stage('Inspect tools and revision') {
+      steps { sh '''#!/usr/bin/env bash
+        set -euo pipefail
+        aws --version; docker --version; node --version; npm --version; jq --version
+        git rev-parse --short=12 HEAD
+      ''' }
+    }
+    stage('Validate Team 5 AWS Credentials') {
+     steps {
+        withAWS(
+          role: env.AWS_DEPLOY_ROLE,
+          roleAccount: env.AWS_ACCOUNT_ID,
+          region: env.AWS_REGION,
+          useNode: true) 
+        {
+            sh '''
+                set -e
+
+                echo "=== AWS Identity ==="
+                aws sts get-caller-identity
+
+                echo "=== CloudFormation Stack ==="
+                aws cloudformation describe-stacks \
+                    --region ca-central-1 \
+                    --stack-name leap-team5 \
+                    --query 'Stacks[0].StackStatus' \
+                    --output text
+
+                echo "=== ECS Cluster ==="
+                aws ecs describe-clusters \
+                    --region ca-central-1 \
+                    --clusters leap-team5 \
+                    --query 'clusters[0].status' \
+                    --output text
+
+                echo "=== ECR Repositories ==="
+                aws ecr describe-repositories \
+                    --region ca-central-1 \
+                    --repository-names leap/team5/orders \
+                    --query 'repositories[0].repositoryName' \
+                    --output text
+            '''
+        }
+      }
+    }
+    stage('Build Docker images') {
+      steps { sh '''#!/usr/bin/env bash
+        set -euo pipefail
+        for component in orders auth holdings reporting; do
+          case "$component" in
+            orders) context="$ORDERS_CONTEXT" ;;
+            auth) context="$AUTH_CONTEXT" ;;
+            holdings) context="$HOLDINGS_CONTEXT" ;;
+            reporting) context="$REPORTING_CONTEXT" ;;
+          esac
+          test -f "$context/Dockerfile" || { echo "Missing $context/Dockerfile"; exit 1; }
+          docker build -t "leap-$TEAM_ID-$component:$BUILD_NUMBER" "$context"
+        done
+      ''' }
+    }
+    stage('Build Angular applications') {
+      steps { sh '''#!/usr/bin/env bash
+        set -euo pipefail
+        (cd "$ANGULAR_APP_PATH" && npm ci && npm run build -- --configuration production)
+        (cd "$ADMIN_APP_PATH" && npm ci && npm run build -- --configuration production)
+        test -f "$ANGULAR_DIST_PATH/index.html" || { echo "Wrong ANGULAR_DIST_PATH"; exit 1; }
+        test -f "$ADMIN_DIST_PATH/index.html" || { echo "Wrong ADMIN_DIST_PATH"; exit 1; }
+      ''' }
+    }
+    stage('Publish images and Angular files') {
+      steps {
+        // Requires Jenkins Pipeline: AWS Steps plugin and a scoped per-team deploy role.
+        withAWS(role: env.AWS_DEPLOY_ROLE,roleAccount: env.AWS_ACCOUNT_ID,region: env.AWS_REGION, useNode: true) {
+          sh '''#!/usr/bin/env bash
+            aws sts get-caller-identity
+            set -euo pipefail
+            export AWS_DEFAULT_REGION="$AWS_REGION"
+            aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].Outputs' --output json > leap-outputs.json
+            get_output() { jq -er --arg k "$1" '.[] | select(.OutputKey==$k) | .OutputValue' leap-outputs.json; }
+            test "$(get_output TeamId)" = "$TEAM_ID" || { echo 'Wrong team stack'; exit 1; }
+            TAG="$(git rev-parse --short=12 HEAD)"
+            REGISTRY="$(get_output OrdersRepository | cut -d/ -f1)"
+            aws ecr get-login-password --region "$AWS_REGION" | \
+              docker login --username AWS --password-stdin "$REGISTRY"
+            for component in orders auth holdings reporting; do
+              case "$component" in
+                orders) REPO="$(get_output OrdersRepository)" ;;
+                auth) REPO="$(get_output AuthRepository)" ;;
+                holdings) REPO="$(get_output HoldingsRepository)" ;;
+                reporting) REPO="$(get_output ReportingRepository)" ;;
+              esac
+              IMAGE="$REPO:$TAG"
+              docker tag "leap-$TEAM_ID-$component:$BUILD_NUMBER" "$IMAGE"
+              docker push "$IMAGE"
+              echo "Published $component: $IMAGE"
+            done
+            aws s3 sync "$ANGULAR_DIST_PATH/" "s3://$(get_output BucketName)/" --delete
+            aws s3 sync "$ADMIN_DIST_PATH/" "s3://$(get_output AdminBucketName)/" --delete
+            aws cloudfront create-invalidation --distribution-id "$(get_output DistributionId)" --paths '/*'
+            aws cloudfront create-invalidation --distribution-id "$(get_output AdminDistributionId)" --paths '/*'
+            echo "Main frontend: $(get_output FrontendUrl)"
+            echo "Admin frontend: $(get_output AdminFrontendUrl)"
+          '''
+        }
+      }
+    }
+    stage('Instructor approval for ECS deployment') {
+      steps {
+        // Pauses after publishing artifacts but before updating ECS services.
+        // Restrict Jenkins job access to instructors; optionally set submitter
+        // to your actual Jenkins instructor username for stronger enforcement.
+        timeout(time: 30, unit: 'MINUTES') {
+          input message: "Approve deployment of ${env.TEAM_ID} images to ECS in ${env.AWS_REGION}?",
+                ok: 'Deploy to ECS'
+        }
+      }
+    }
+    stage('Deploy images to existing ECS services') {
+      steps {
+          withAWS(role: env.AWS_DEPLOY_ROLE,roleAccount: env.AWS_ACCOUNT_ID,region: env.AWS_REGION, useNode: true) {
+          sh '''#!/usr/bin/env bash
+            set -euo pipefail
+            export AWS_DEFAULT_REGION="$AWS_REGION"
+            aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].Outputs' --output json > leap-outputs.json
+            get_output() { jq -er --arg k "$1" '.[] | select(.OutputKey==$k) | .OutputValue' leap-outputs.json; }
+            test "$(get_output TeamId)" = "$TEAM_ID" || { echo 'Wrong team stack'; exit 1; }
+            CLUSTER="$(get_output ClusterName)"
+            TAG="$(git rev-parse --short=12 HEAD)"
+            for component in orders auth holdings reporting; do
+              case "$component" in
+                orders) REPO="$(get_output OrdersRepository)" ;;
+                auth) REPO="$(get_output AuthRepository)" ;;
+                holdings) REPO="$(get_output HoldingsRepository)" ;;
+                reporting) REPO="$(get_output ReportingRepository)" ;;
+              esac
+              SERVICE="leap-$TEAM_ID-$component"
+              IMAGE="$REPO:$TAG"
+              # Use the existing task definition as the source of truth for
+              # environment variables, secrets, IAM roles, CPU/memory and logging.
+              CURRENT="$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+                --query 'services[0].taskDefinition' --output text)"
+              [[ -n "$CURRENT" && "$CURRENT" != 'None' ]] || { echo "Missing ECS service $SERVICE"; exit 1; }
+              aws ecs describe-task-definition --task-definition "$CURRENT" \
+                --query 'taskDefinition' --output json > current-task.json
+              # Fail rather than accidentally changing an unrelated container.
+              jq -e --arg name "$component" '.containerDefinitions | any(.name == $name)' current-task.json >/dev/null
+              jq --arg name "$component" --arg image "$IMAGE" '
+              .containerDefinitions |= map(if .name == $name then (.image = $image | del(.command)) else . end)
+              | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,
+              .registeredAt,.registeredBy,.deregisteredAt)
+              ' current-task.json > next-task.json
+              NEXT="$(aws ecs register-task-definition --cli-input-json file://next-task.json \
+                --query 'taskDefinition.taskDefinitionArn' --output text)"
+              aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+                --task-definition "$NEXT" --force-new-deployment >/dev/null
+              echo "Deploying $SERVICE with $IMAGE"
+            done
+            aws ecs wait services-stable --cluster "$CLUSTER" --services \
+              "leap-$TEAM_ID-orders" "leap-$TEAM_ID-auth" \
+              "leap-$TEAM_ID-holdings" "leap-$TEAM_ID-reporting"
+            echo 'All four ECS services reached stable state.'
+          '''
+        }
+      }
+    }
+    stage('Backend health checks (deployed ECS services)') {
+      steps {
+       withAWS(role: env.AWS_DEPLOY_ROLE,roleAccount: env.AWS_ACCOUNT_ID,region: env.AWS_REGION, useNode: true) {
+        sh '''
+            set -e
+
+            for service in Orders Auth Holdings Reporting; do
+                echo "Checking $service health..."
+
+                TARGET_ARN=$(aws cloudformation describe-stack-resource \
+                    --region ca-central-1 \
+                    --stack-name leap-team5 \
+                    --logical-resource-id "${service}Target" \
+                    --query 'StackResourceDetail.PhysicalResourceId' \
+                    --output text)
+
+                aws elbv2 wait target-in-service \
+                    --region ca-central-1 \
+                    --target-group-arn "$TARGET_ARN"
+
+                echo "$service is healthy"
+            done
+        '''
+      }
+     }
+    }
+    stage('Route checks (CloudFront to ALB to service)') {
+      steps {
+        withAWS(role: env.AWS_DEPLOY_ROLE, roleAccount: env.AWS_ACCOUNT_ID, region: env.AWS_REGION, useNode: true) {
+          sh '''#!/usr/bin/env bash
+            set -uo pipefail
+            aws cloudformation describe-stacks --region "$AWS_REGION" --stack-name "$STACK_NAME" \
+              --query 'Stacks[0].Outputs' --output json > leap-outputs.json
+            get_output() { jq -er --arg k "$1" '.[] | select(.OutputKey==$k) | .OutputValue' leap-outputs.json; }
+            FAILS=0
+            for URL in "$(get_output FrontendUrl)" "$(get_output AdminFrontendUrl)"; do
+              URL=${URL%/}
+              for r in $ROUTE_TESTS; do
+                svc=${r%%|*}; rest=${r#*|}; path=${rest%%|*}; ok=${rest#*|}
+                code=000
+                # Retry for up to about a minute: new tasks and CloudFront can take a moment to settle.
+                for attempt in 1 2 3 4 5 6; do
+                  code=$(curl -s -o body.json -w '%{http_code}' --max-time 15 "$URL$path" || true)
+                  case ",$ok," in *",$code,"*) break ;; esac
+                  sleep 10
+                done
+                case ",$ok," in
+                  *",$code,"*) echo "PASS  $svc  $URL$path -> HTTP $code" ;;
+                  *) echo "FAIL  $svc  $URL$path -> HTTP $code (expected $ok). Body: $(head -c 200 body.json | tr '\\n' ' ')"
+                     FAILS=$((FAILS+1)) ;;
+                esac
+              done
+            done
+            [ "$FAILS" -eq 0 ] || { echo "$FAILS route check(s) failed"; exit 1; }
+          '''
+        }
+      }
+    }
+  }
+  post { success { echo 'Images pushed, ECS services deployed, Angular apps published, and health checks passed.' }
+         failure { echo 'Publishing pipeline failed. Review stage output.' } }
+}
