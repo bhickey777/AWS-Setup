@@ -1,6 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Hello World Wealth shared Jenkins controller (classroom starter; instructor managed).
+Description: >
+  Hello World Wealth per-team Jenkins controller (classroom; instructor managed).
+  Deploy once per team, passing TeamTag=team1 .. team4. Each team gets its own VPC,
+  security group, IAM role and EC2 instance.
+
 Parameters:
+  TeamTag:
+    Type: String
+    Description: Team this Jenkins belongs to, team1 to team4. Also selects the hww-<team>-deploy role it may assume.
+    AllowedValues: [team1, team2, team3, team4]
   AdminCidr:
     Type: String
     Description: Instructor public IPv4 CIDR, e.g. 203.0.113.5/32
@@ -13,16 +21,31 @@ Parameters:
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Mappings:
+  # Each team gets its own address range, so the four networks can be joined later if needed.
+  TeamNetwork:
+    team1: {VpcCidr: 10.91.0.0/16, SubnetCidr: 10.91.1.0/24}
+    team2: {VpcCidr: 10.92.0.0/16, SubnetCidr: 10.92.1.0/24}
+    team3: {VpcCidr: 10.93.0.0/16, SubnetCidr: 10.93.1.0/24}
+    team4: {VpcCidr: 10.94.0.0/16, SubnetCidr: 10.94.1.0/24}
+
 Resources:
   JenkinsVpc:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: 10.90.0.0/16
+      CidrBlock: !FindInMap [TeamNetwork, !Ref TeamTag, VpcCidr]
       EnableDnsHostnames: true
       EnableDnsSupport: true
-      Tags: [{Key: Name, Value: hww-jenkins-vpc}]
+      Tags:
+        - {Key: Name, Value: !Sub 'hww-jenkins-${TeamTag}-vpc'}
+        - {Key: team, Value: !Select [1, !Split ['team', !Ref TeamTag]]}
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: !Sub 'hww-jenkins-${TeamTag}-igw'}
+        - {Key: team, Value: !Select [1, !Split ['team', !Ref TeamTag]]}
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties: {VpcId: !Ref JenkinsVpc, InternetGatewayId: !Ref InternetGateway}
@@ -30,11 +53,18 @@ Resources:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref JenkinsVpc
-      CidrBlock: 10.90.1.0/24
+      CidrBlock: !FindInMap [TeamNetwork, !Ref TeamTag, SubnetCidr]
       MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub 'hww-jenkins-${TeamTag}-public'}
+        - {Key: team, Value: !Select [1, !Split ['team', !Ref TeamTag]]}
   PublicRoutes:
     Type: AWS::EC2::RouteTable
-    Properties: {VpcId: !Ref JenkinsVpc}
+    Properties:
+      VpcId: !Ref JenkinsVpc
+      Tags:
+        - {Key: Name, Value: !Sub 'hww-jenkins-${TeamTag}-rt'}
+        - {Key: team, Value: !Select [1, !Split ['team', !Ref TeamTag]]}
   PublicInternetRoute:
     Type: AWS::EC2::Route
     DependsOn: AttachGateway
@@ -50,21 +80,28 @@ Resources:
       SecurityGroupIngress:
         - {IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref AdminCidr}
         - {IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: !Ref AdminCidr}
+      Tags:
+        - {Key: Name, Value: !Sub 'hww-jenkins-${TeamTag}-sg'}
+        - {Key: team, Value: !Select [1, !Split ['team', !Ref TeamTag]]}
   JenkinsRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: hww-jenkins-controller-role
+      # Named per team so four stacks can exist side by side.
+      RoleName: !Sub 'hww-jenkins-${TeamTag}-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
       Policies:
-        - PolicyName: AssumeHwwTeamDeployRoles
+        - PolicyName: AssumeOwnTeamDeployRole
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # Only this team's deploy role, not hww-team*-deploy.
               - Effect: Allow
                 Action: 'sts:AssumeRole'
-                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/hww-team*-deploy'
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/hww-${TeamTag}-deploy'
+      Tags:
+        - {Key: team, Value: !Select [1, !Split ['team', !Ref TeamTag]]}
   JenkinsProfile:
     Type: AWS::IAM::InstanceProfile
     Properties: {Roles: [!Ref JenkinsRole]}
@@ -81,7 +118,9 @@ Resources:
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs: {VolumeType: gp3, VolumeSize: 80, Encrypted: true, DeleteOnTermination: true}
-      Tags: [{Key: Name, Value: hww-jenkins-server}]
+      Tags:
+        - {Key: Name, Value: !Sub 'hww-jenkins-${TeamTag}'}
+        - {Key: team, Value: !Select [1, !Split ['team', !Ref TeamTag]]}
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
@@ -96,7 +135,9 @@ Resources:
           usermod -aG docker jenkins
           systemctl enable --now jenkins
 Outputs:
+  Team: {Value: !Ref TeamTag}
   JenkinsPublicIp: {Value: !GetAtt JenkinsInstance.PublicIp}
   JenkinsUrl: {Value: !Sub 'http://${JenkinsInstance.PublicDnsName}:8080'}
   JenkinsRoleArn: {Value: !GetAtt JenkinsRole.Arn}
   JenkinsInstanceId: {Value: !Ref JenkinsInstance}
+  DeployRoleItMayAssume: {Value: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/hww-${TeamTag}-deploy'}
