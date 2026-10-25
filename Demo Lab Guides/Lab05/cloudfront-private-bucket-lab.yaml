@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lab 5 resources. A fully private S3 bucket, an Origin Access Control, a CloudFront
+  distribution with the bucket as its origin, and a bucket policy that lets only that one
+  distribution read the files. Block Public Access stays on the whole time.
+
+Parameters:
+  BucketSuffix:
+    Type: String
+    Default: mission-ui
+    Description: Added to the bucket name. The full name also contains the account ID and region, so it is globally unique.
+    AllowedPattern: '[a-z0-9-]+'
+
+Resources:
+  # ---- Part 1: a private bucket, deliberately ---------------------------------------------
+  # All four Block Public Access settings are on. These are the same values a new bucket
+  # gets by default; they are written out so the stack makes the "private" choice visible.
+  # Nothing in this template turns any of them off.
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-${BucketSuffix}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---- Part 2, step 4: Origin Access Control ---------------------------------------------------
+  # The OAC is CloudFront's identity when it talks to S3. With sigv4 and "always", every
+  # request CloudFront makes to the bucket is signed, so the bucket can tell it apart from
+  # an anonymous visitor.
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---- Part 2, step 5: the distribution --------------------------------------------------------
+  # Origin = the bucket's regional address (not the S3 website address, which cannot be
+  # private). The OAC is attached to that origin. index.html is served for the root path.
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AWS::StackName} lab 5 distribution'
+        DefaultRootObject: index.html
+        Origins:
+          - Id: s3-origin
+            DomainName: !GetAtt Bucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig: {OriginAccessIdentity: ''}
+        DefaultCacheBehavior:
+          TargetOriginId: s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed policy "CachingOptimized": keeps copies at the edge for a long time.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        # The default *.cloudfront.net address already comes with a working HTTPS certificate.
+        ViewerCertificate: {CloudFrontDefaultCertificate: true}
+
+  # ---- Part 2, step 6: the bucket policy ----------------------------------------------------------
+  # Who: the CloudFront service, a named AWS service, not "*". That is why S3 does not treat
+  # this policy as public, and why it is accepted while Block Public Access is still on.
+  # What: read files only (s3:GetObject).
+  # Condition: only the one distribution created above. Any other CloudFront distribution,
+  # in any account, is refused. The distribution's ARN is built from its ID.
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub '${Bucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+Outputs:
+  BucketName:
+    Description: Upload the build here, for example with aws s3 sync.
+    Value: !Ref Bucket
+  DistributionId:
+    Description: Use with aws cloudfront get-distribution to check the status.
+    Value: !Ref Distribution
+  CloudFrontUrl:
+    Description: The site over HTTPS. Part 3, steps 10 and 11.
+    Value: !Sub 'https://${Distribution.DomainName}/'
+  DirectS3Url:
+    Description: Straight to the bucket. This should return AccessDenied. Part 1 step 3 and Part 3 step 9.
+    Value: !Sub 'https://${Bucket.RegionalDomainName}/index.html'
+  OriginAccessControlId:
+    Value: !GetAtt OriginAccessControl.Id

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 5 - Mission UI</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #0b1b2b; color: #e8eef5; }
+  main { max-width: 640px; margin: 15vh auto; padding: 0 24px; text-align: center; }
+  h1 { font-size: 2rem; margin-bottom: .25em; }
+  p { color: #aab8c8; line-height: 1.5; }
+  .badge { display: inline-block; padding: 6px 14px; border-radius: 999px; background: #1f6f43; color: #fff; font-size: .9rem; }
+  code { background: #17304a; padding: 2px 6px; border-radius: 4px; }
+  #loaded { margin-top: 2em; font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <span class="badge">Served by CloudFront</span>
+  <h1>Mission UI</h1>
+  <p>If you can read this, the request went through CloudFront and the private S3 bucket handed over <code>index.html</code>.</p>
+  <p>Opening the bucket's own address directly should give <code>AccessDenied</code>.</p>
+  <p id="loaded"></p>
+</main>
+<script>
+  document.getElementById('loaded').textContent =
+    'Page loaded from ' + location.host + ' at ' + new Date().toLocaleTimeString();
+</script>
+</body>
+</html>

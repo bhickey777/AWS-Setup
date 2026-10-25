@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lab 8. Deploying the backend to ECS. Adds to an EXISTING VPC (Module 3), ECR image (Module 6)
+  and cluster and task definition (Module 7): PrivateLink endpoints for ECR and CloudWatch Logs
+  (no NAT Gateway), an S3 gateway endpoint, an Application Load Balancer with an ip target
+  group, and an ECS Fargate service in the private subnets with a rolling deployment.
+
+Parameters:
+  Team:
+    Type: String
+    AllowedValues: ['1', '2', '3', '4']
+    Description: Team number. Applied as the tag team=<number> on everything this stack creates.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The Module 3 VPC.
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Exactly two private subnets, in different Availability Zones.
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Exactly two public subnets, in different Availability Zones.
+  AppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Your existing app security group (the one the tasks use).
+  ClusterName:
+    Type: String
+    Default: leap-mission-cluster
+    Description: The Module 7 ECS cluster.
+  TaskDefinitionArn:
+    Type: String
+    Description: Full ARN of the Module 7 task definition revision, including the revision number.
+  ContainerName:
+    Type: String
+    Default: mission-service
+    Description: Container name inside the task definition. Must match exactly.
+  ContainerPort:
+    Type: Number
+    Default: 8080
+  ServiceName:
+    Type: String
+    Default: leap-mission-service
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  HealthCheckPath:
+    Type: String
+    Default: /actuator/health
+  HealthCheckMatcher:
+    Type: String
+    Default: '200,401'
+    Description: HTTP codes the load balancer treats as healthy. 401 is included because /actuator/health requires authentication.
+  PrivateRouteTableId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional. Leave empty to create a new route table (local route only) and associate it with
+      both private subnets. If the subnets already have their own route table with no internet route,
+      give its ID and the S3 gateway endpoint is attached to that table instead.
+
+Conditions:
+  CreateRouteTable: !Equals [!Ref PrivateRouteTableId, '']
+
+Resources:
+  # ---- Part 1: reach ECR and CloudWatch Logs without a NAT Gateway ----------------------------
+  # Step 1. Only the app security group may talk to the endpoints, on 443.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC interface endpoints, HTTPS from the app security group only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref AppSecurityGroupId, Description: HTTPS from app tasks}
+      Tags:
+        - {Key: Name, Value: !Sub 'lab8-team${Team}-endpoints-sg'}
+        - {Key: team, Value: !Ref Team}
+
+  # Step 2. Three interface endpoints with private DNS, so the normal ECR and Logs names
+  # resolve to private addresses inside the VPC.
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # Step 3. A route table with only the automatic local route (no NAT, no internet gateway),
+  # attached to both private subnets, plus a free S3 gateway endpoint. ECR image layers are in S3.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateRouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - {Key: Name, Value: !Sub 'lab8-team${Team}-private-rt'}
+        - {Key: team, Value: !Ref Team}
+  PrivateAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateRouteTable
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Select [0, !Ref PrivateSubnetIds]
+  PrivateAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateRouteTable
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Select [1, !Ref PrivateSubnetIds]
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !If [CreateRouteTable, !Ref PrivateRouteTable, !Ref PrivateRouteTableId]
+
+  # ---- Part 2: a stable entry point ------------------------------------------------------------
+  # Step 4. The load balancer accepts HTTP from anywhere.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer, HTTP from the internet
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP from anywhere}
+      Tags:
+        - {Key: Name, Value: !Sub 'lab8-team${Team}-alb-sg'}
+        - {Key: team, Value: !Ref Team}
+
+  # Step 7. The app security group lets the load balancer in on the container port, and nothing else.
+  AppFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroupId
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: Container port from the load balancer
+
+  # Step 5. target-type ip, because Fargate tasks have no fixed instance. The matcher accepts 401
+  # because the health endpoint is protected by authentication.
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: {HttpCode: !Ref HealthCheckMatcher}
+      TargetGroupAttributes:
+        # Drain old tasks faster so a rolling deployment finishes sooner in class.
+        - {Key: deregistration_delay.timeout_seconds, Value: '30'}
+      Tags:
+        - {Key: Name, Value: !Sub 'lab8-team${Team}-tg'}
+        - {Key: team, Value: !Ref Team}
+
+  # Step 6. Load balancer in the public subnets, listener on 80.
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Tags:
+        - {Key: Name, Value: !Sub 'lab8-team${Team}-alb'}
+        - {Key: team, Value: !Ref Team}
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - {Type: forward, TargetGroupArn: !Ref TargetGroup}
+
+  # ---- Part 3 and 4: a managed, continuously running service ------------------------------
+  # Step 8. Private subnets, no public IP, attached to the target group.
+  # DependsOn makes sure the endpoints and S3 route exist before the first task tries to pull
+  # its image, and that the listener exists before the service registers with the target group.
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, EcrApiEndpoint, EcrDkrEndpoint, LogsEndpoint, S3GatewayEndpoint, AppFromAlb]
+    Properties:
+      Cluster: !Ref ClusterName
+      ServiceName: !Ref ServiceName
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinitionArn
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 60
+      # Step 11. New tasks start and pass health checks before old ones are stopped.
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: {Enable: true, Rollback: true}
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups: [!Ref AppSecurityGroupId]
+      LoadBalancers:
+        - ContainerName: !Ref ContainerName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      Tags:
+        - {Key: team, Value: !Ref Team}
+
+Outputs:
+  AlbDnsName:
+    Description: Step 10. Request this from your own machine, not a task IP address.
+    Value: !GetAtt LoadBalancer.DNSName
+  AlbUrl:
+    Value: !Sub 'http://${LoadBalancer.DNSName}${HealthCheckPath}'
+  TargetGroupArn:
+    Description: Use with aws elbv2 describe-target-health.
+    Value: !Ref TargetGroup
+  ServiceName:
+    Value: !Ref ServiceName
+  EndpointIds:
+    Value: !Join [',', [!Ref EcrApiEndpoint, !Ref EcrDkrEndpoint, !Ref LogsEndpoint, !Ref S3GatewayEndpoint]]

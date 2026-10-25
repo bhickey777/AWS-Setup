@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lab 7. Introduction to ECS. Creates the ECS cluster, the task execution role, a CloudWatch log
+  group, a Fargate task definition for your Module 6 image, and a security group for the container
+  port. The task itself is started by hand with run-task, as the lab asks. Module 8 builds on
+  everything created here. Every name includes the team number, so several teams can share a region.
+
+Parameters:
+  Team:
+    Type: String
+    AllowedValues: ['1', '2', '3', '4']
+    Description: Team number. Applied as the tag team=<number> and used in every resource name.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The Module 3 VPC. The security group is created in it.
+  ImageUri:
+    Type: String
+    Description: Full image URI from Module 6 including the tag, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/leap-mission-service:v1
+  ContainerName:
+    Type: String
+    Default: mission-service
+    Description: Name of the container inside the task definition. Later labs refer to it, so keep it simple.
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    Description: The port your application really listens on. Check the EXPOSE line in the Dockerfile. Do not assume.
+  CpuArchitecture:
+    Type: String
+    Default: X86_64
+    AllowedValues: [X86_64, ARM64]
+    Description: >
+      Must match how the image was built. Check with docker manifest inspect (README step 4).
+      An image built on Apple Silicon is usually ARM64. A mismatch fails with exec format error.
+  Cpu:
+    Type: String
+    Default: '512'
+    AllowedValues: ['256', '512', '1024', '2048']
+    Description: Fargate CPU units.
+  Memory:
+    Type: String
+    Default: '1024'
+    AllowedValues: ['512', '1024', '2048', '3072', '4096']
+    Description: Fargate memory in MiB. Java applications usually need 1024 or more. Must be valid for the CPU chosen.
+
+Resources:
+  # ---- Part 1, step 1: the cluster ---------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'leap-mission-cluster-team${Team}'
+      Tags: [{Key: team, Value: !Ref Team}]
+
+  # ---- Part 1, step 3: the log group the task definition sends logs to ---------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/leap/mission-service/team${Team}'
+      RetentionInDays: 7
+      Tags: [{Key: team, Value: !Ref Team}]
+
+  # ---- Part 1, step 2: the task execution role ---------------------------------------------------
+  # The ECS agent uses this role to pull the image from ECR and write logs. It is not the role
+  # your application code runs as. It trusts ecs-tasks.amazonaws.com only.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'leap-team${Team}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Tags: [{Key: team, Value: !Ref Team}]
+
+  # ---- Part 1, steps 3 and 4: the Fargate task definition -----------------------------------------
+  # RuntimePlatform states the CPU architecture explicitly, so a mismatch with the image is
+  # decided here rather than discovered when the task fails to start.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'leap-mission-service-team${Team}'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: !Ref CpuArchitecture
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: !Ref ContainerName
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - {ContainerPort: !Ref ContainerPort, Protocol: tcp}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: ecs
+      Tags: [{Key: team, Value: !Ref Team}]
+
+  # ---- Part 2, step 5: the security group ---------------------------------------------------------
+  # For today this is deliberately wide open: the container port from anywhere, so a request
+  # from your own machine can reach the task. Module 8 replaces this with the load balancer only.
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lab 7 app, container port from anywhere (testing only)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          CidrIp: 0.0.0.0/0
+          Description: Container port from anywhere, testing only
+      Tags:
+        - {Key: Name, Value: !Sub 'leap-team${Team}-app-sg'}
+        - {Key: team, Value: !Ref Team}
+
+Outputs:
+  ClusterName:
+    Description: Use with run-task and with Module 8.
+    Value: !Ref Cluster
+  TaskDefinitionFamily:
+    Description: Pass this to run-task, or the full ARN below.
+    Value: !Sub 'leap-mission-service-team${Team}'
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  ExecutionRoleName:
+    Description: Needed by the Lab 11 pipeline role stack.
+    Value: !Ref ExecutionRole
+  ExecutionRoleArn:
+    Value: !GetAtt ExecutionRole.Arn
+  LogGroupName:
+    Description: Where the task logs go. Read them with aws logs tail.
+    Value: !Ref LogGroup
+  AppSecurityGroupId:
+    Description: Attach to the task with run-task. Module 8 builds on this group.
+    Value: !GetAtt AppSecurityGroup.GroupId
+  ContainerName:
+    Value: !Ref ContainerName
+  ContainerPort:
+    Value: !Ref ContainerPort
