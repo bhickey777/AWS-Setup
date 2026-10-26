@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Deployment week - WEDNESDAY: Stage 2, CDN edge and S3 storage. Two private S3 buckets
+  (Client UI and Admin UI), an Origin Access Control, a CloudFront distribution routing
+  / to the Client bucket and /admin* to the Admin bucket, and the bucket policies that let
+  only this distribution read them (Appendix A).
+
+# Deploy:
+#   aws cloudformation deploy --stack-name matrix-cdn --template-file 3-wednesday-cdn.yaml
+#
+# Thursday is a stack UPDATE of this same stack:
+#   aws cloudformation deploy --stack-name matrix-cdn --template-file 4-thursday-cdn-polish.yaml
+#
+# Uploading the builds (see the Outputs for your bucket names):
+#   Client:  aws s3 sync dist/<client-app>/browser  s3://<ClientBucketName>/  --delete
+#   Admin:   aws s3 sync dist/<admin-app>/browser   s3://<AdminBucketName>/admin/  --delete
+#            ^ the Admin files MUST go under the admin/ prefix. CloudFront forwards the full
+#              path, so a request for /admin/main.js reads the object admin/main.js.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: matrix
+    AllowedPattern: '^[a-z][a-z0-9-]{1,19}$'
+
+Resources:
+  # ---------------------------------------------------------------- Private buckets
+  ClientUiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-client-ui-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  AdminUiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-admin-ui-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  # ---------------------------------------------------------------- CloudFront
+  S3OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-s3-oac'
+        Description: Lets CloudFront sign requests to the private UI buckets
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName} Client and Admin UIs'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: client-ui-s3
+            DomainName: !GetAtt ClientUiBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt S3OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''   # must be empty when using OAC
+          - Id: admin-ui-s3
+            DomainName: !GetAtt AdminUiBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt S3OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: client-ui-s3
+          # allow-all, NOT redirect-to-https: the Angular apps call the APIs over plain
+          # http://<ip>:3000 and :8080. A page loaded over https:// cannot call http:// APIs
+          # (the browser blocks it as mixed content), so the site must be opened over http://
+          # until the APIs get TLS.
+          ViewerProtocolPolicy: allow-all
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # AWS managed "CachingOptimized"
+        CacheBehaviors:
+          - PathPattern: 'admin*'
+            TargetOriginId: admin-ui-s3
+            ViewerProtocolPolicy: allow-all
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  # ---------------------------------------------------------------- Bucket policies (Appendix A)
+  ClientUiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ClientUiBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontProxyRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${ClientUiBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  AdminUiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AdminUiBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontProxyRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${AdminUiBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+Outputs:
+  SiteUrl:
+    Description: Open over http:// (see the ViewerProtocolPolicy comment). Add this origin to the backend CORS allow-list.
+    Value: !Sub 'http://${Distribution.DomainName}'
+  AdminUrl:
+    Value: !Sub 'http://${Distribution.DomainName}/admin/'
+  DistributionId:
+    Value: !Ref Distribution
+  ClientBucketName:
+    Value: !Ref ClientUiBucket
+  AdminBucketName:
+    Value: !Ref AdminUiBucket
+  UploadClientCommand:
+    Value: !Sub 'aws s3 sync dist/<client-app>/browser s3://${ClientUiBucket}/ --delete'
+  UploadAdminCommand:
+    Value: !Sub 'aws s3 sync dist/<admin-app>/browser s3://${AdminUiBucket}/admin/ --delete'
+  InvalidateCacheCommand:
+    Value: !Sub 'aws cloudfront create-invalidation --distribution-id ${Distribution} --paths "/*"'

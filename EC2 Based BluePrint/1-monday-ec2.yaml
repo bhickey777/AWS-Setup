@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Deployment week - MONDAY: Docker "lift & shift" baseline. One EC2 instance (Ubuntu 24.04)
+  running the whole docker compose stack, an IAM instance role that is ready for Tuesday's
+  Secrets Manager secret, and a security group for SSH, 80, 443, 3000 and 8080.
+
+# Deploy:
+#   aws cloudformation deploy \
+#     --stack-name matrix-monday \
+#     --template-file 1-monday-ec2.yaml \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides KeyName=my-key MyIpCidr=203.0.113.10/32 \
+#                           VpcId=vpc-xxxx SubnetId=subnet-xxxx
+#
+# Resize (pitfall "Resize, don't rebuild"): re-run the same command with
+#   InstanceType=m6a.xlarge  -> CloudFormation stops, resizes and restarts the instance.
+#   The Elastic IP below keeps the public IP unchanged, so the Angular env files stay valid.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Naming }
+        Parameters: [ProjectName]
+      - Label: { default: Network }
+        Parameters: [VpcId, SubnetId, MyIpCidr]
+      - Label: { default: Instance }
+        Parameters: [InstanceType, KeyName, UbuntuAmiId, RootVolumeSizeGiB]
+      - Label: { default: Optional auto-deploy }
+        Parameters: [GitRepoUrl, ComposeSubdir]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: matrix
+    AllowedPattern: '^[a-z][a-z0-9-]{1,19}$'
+    Description: Lowercase prefix for names and stack exports. Give each team its own value if several teams share one AWS account.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch into (the default VPC is fine).
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: A PUBLIC subnet in that VPC (any default-VPC subnet is public).
+
+  MyIpCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/32$'
+    ConstraintDescription: Must look like 203.0.113.10/32
+    Description: Your public IP for SSH, as x.x.x.x/32. Find it with  curl -s https://checkip.amazonaws.com
+
+  InstanceType:
+    Type: String
+    Default: m6a.large
+    AllowedValues: [m6a.large, m6a.xlarge]
+    Description: m6a.large (2 vCPU / 8 GB). Switch to m6a.xlarge (4 vCPU / 16 GB) if containers run out of memory.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair for SSH (user name is "ubuntu").
+
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Latest Ubuntu 24.04 LTS AMI, looked up automatically. Leave as is.
+
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 30
+    MinValue: 20
+    MaxValue: 200
+    Description: Root disk size. Kafka, Postgres, JVM and Node images fill the 8 GB default quickly.
+
+  GitRepoUrl:
+    Type: String
+    Default: ''
+    Description: Optional. Public HTTPS URL of the repo holding docker-compose.yml. If set, the instance clones it and runs  docker compose up -d  on first boot. Leave blank to clone by hand.
+
+  ComposeSubdir:
+    Type: String
+    Default: ''
+    Description: Optional. Folder inside the repo that contains docker-compose.yml (blank = repo root).
+
+Resources:
+  # ---------------------------------------------------------------- IAM (Lock 3)
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-InstanceSecretsReaderRole'
+      Description: Lets code on the EC2 instance read the project's Secrets Manager secrets.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Not in the blueprint: enables Session Manager as a fallback when SSH is locked out.
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: ReadProjectSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                # Wildcard so the role works before Tuesday's secret exists.
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/production/*'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-InstanceSecretsReaderProfile'
+      Roles: [!Ref InstanceRole]
+
+  # ---------------------------------------------------------------- Security group (Lock 1)
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ec2-sg'
+      GroupDescription: Monday EC2 host - SSH from my IP, web and API ports from anywhere
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22,   ToPort: 22,   CidrIp: !Ref MyIpCidr, Description: SSH from my IP only }
+        - { IpProtocol: tcp, FromPort: 80,   ToPort: 80,   CidrIp: 0.0.0.0/0,     Description: Angular UIs (Monday and Tuesday) }
+        - { IpProtocol: tcp, FromPort: 443,  ToPort: 443,  CidrIp: 0.0.0.0/0,     Description: HTTPS (reserved for later TLS) }
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, CidrIp: 0.0.0.0/0,     Description: Node.js Auth API }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0,     Description: Spring Boot Orders API }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-ec2-sg' }
+
+  # ---------------------------------------------------------------- Compute
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref InstanceSecurityGroup]
+          AssociatePublicIpAddress: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref RootVolumeSizeGiB
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      MetadataOptions:
+        HttpTokens: required
+        # Hop limit 2 is required so the AWS SDK running INSIDE a Docker container
+        # can reach the instance metadata service and pick up the instance role.
+        # With the default of 1, Tuesday's Secrets Manager call fails with a credentials error.
+        HttpPutResponseHopLimit: 2
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-docker-host' }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/matrix-bootstrap.log) 2>&1
+          export DEBIAN_FRONTEND=noninteractive
+
+          # --- Docker Engine + Compose plugin (official repository, docs.docker.com) ---
+          apt-get update
+          apt-get install -y ca-certificates curl git
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+            > /etc/apt/sources.list.d/docker.list
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          # --- Optional: clone the repo and start the stack ---
+          REPO_URL="${GitRepoUrl}"
+          COMPOSE_DIR="${ComposeSubdir}"
+          if [ -n "$REPO_URL" ]; then
+            sudo -u ubuntu git clone "$REPO_URL" /home/ubuntu/app
+            cd "/home/ubuntu/app/$COMPOSE_DIR"
+            docker compose up -d
+          fi
+
+          touch /var/log/matrix-bootstrap.done
+
+  # Keeps the same public IP across stop/start and resizes. Without it the IP changes and
+  # every Angular environment file pointing at it breaks.
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-docker-host-ip' }
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  PublicIp:
+    Description: Use this in the Angular environment files (AUTH_API_URL / ORDERS_API_URL).
+    Value: !Ref ElasticIp
+  SshCommand:
+    Value: !Sub 'ssh -i ${KeyName}.pem ubuntu@${ElasticIp}'
+  BootstrapLog:
+    Description: Docker install log on the instance (finished when /var/log/matrix-bootstrap.done exists).
+    Value: /var/log/matrix-bootstrap.log
+  AuthApiUrl:
+    Value: !Sub 'http://${ElasticIp}:3000'
+  OrdersApiUrl:
+    Value: !Sub 'http://${ElasticIp}:8080'
+  Ec2SecurityGroupId:
+    Description: Pass this to the Tuesday stack as Ec2SecurityGroupId.
+    Value: !Ref InstanceSecurityGroup
+  InstanceRoleName:
+    Value: !Ref InstanceRole

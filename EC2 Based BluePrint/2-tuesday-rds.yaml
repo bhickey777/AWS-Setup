@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Deployment week - TUESDAY: Stage 1, the managed database. RDS PostgreSQL that only the EC2
+  instance can reach, plus the Secrets Manager secret <project>/production/credentials holding
+  DB_USERNAME, DB_PASSWORD, DB_NAME and JWT_SHARED_SECRET.
+
+# Deploy:
+#   aws cloudformation deploy \
+#     --stack-name matrix-tuesday \
+#     --template-file 2-tuesday-rds.yaml \
+#     --parameter-overrides VpcId=vpc-xxxx \
+#                           DbSubnetIds=subnet-aaaa,subnet-bbbb \
+#                           Ec2SecurityGroupId=<Monday output Ec2SecurityGroupId> \
+#                           JwtSharedSecret=$(openssl rand -hex 32)
+#
+# Creating the database takes roughly 10 minutes.
+#
+# Stage 3 decommission: re-deploy this stack with  Ec2SecurityGroupId=""  to remove the
+# EC2 -> RDS rule. That also frees the Monday stack to be deleted.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: matrix
+    AllowedPattern: '^[a-z][a-z0-9-]{1,19}$'
+    Description: Must match the value used on Monday.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Same VPC as the Monday instance.
+
+  DbSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two subnets in DIFFERENT Availability Zones (RDS requires this even for a single-AZ database).
+
+  Ec2SecurityGroupId:
+    Type: String
+    Default: ''
+    Description: Monday output Ec2SecurityGroupId (sg-...). Only this security group may connect on 5432. Set to blank during Stage 3 decommissioning.
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small]
+
+  AllocatedStorageGiB:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+
+  PostgresEngineVersion:
+    Type: String
+    Default: ''
+    Description: Optional, e.g. 16.4. Blank = the current RDS default. Pick a version equal to or newer than the Postgres image in your docker-compose.yml so the pg_dump restore works.
+
+  JwtSharedSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 64
+    Description: 256-bit secret as 64 hex characters. Generate with  openssl rand -hex 32  . Do not change it after the first deploy.
+
+Conditions:
+  AllowEc2Access: !Not [!Equals [!Ref Ec2SecurityGroupId, '']]
+  HasEngineVersion: !Not [!Equals [!Ref PostgresEngineVersion, '']]
+
+Resources:
+  # ---------------------------------------------------------------- Secrets Manager
+  AppCredentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/production/credentials'
+      Description: Database credentials and JWT signing secret for the backend services.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"DB_USERNAME":"postgres_admin","DB_NAME":"orders_db","JWT_SHARED_SECRET":"${JwtSharedSecret}"}'
+        GenerateStringKey: DB_PASSWORD
+        PasswordLength: 32
+        # Letters and digits only: no characters that need escaping in JDBC or Postgres URLs.
+        ExcludePunctuation: true
+
+  # ---------------------------------------------------------------- Network (Lock 2)
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-rds-sg'
+      GroupDescription: RDS PostgreSQL - no inbound access except the rules attached below
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-rds-sg' }
+
+  # Source is the EC2 security group, not an IP range: only code on the instance gets in.
+  RdsIngressFromEc2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: AllowEc2Access
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref Ec2SecurityGroupId
+      Description: PostgreSQL from the Monday EC2 instance
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${ProjectName} RDS subnets'
+      SubnetIds: !Ref DbSubnetIds
+
+  # ---------------------------------------------------------------- Database
+  Database:
+    Type: AWS::RDS::DBInstance
+    # A final snapshot is taken if the stack is deleted. Delete the snapshot afterwards
+    # under RDS -> Snapshots if you do not need it.
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-orders-db'
+      Engine: postgres
+      EngineVersion: !If [HasEngineVersion, !Ref PostgresEngineVersion, !Ref 'AWS::NoValue']
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref AllocatedStorageGiB
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: orders_db
+      MasterUsername: postgres_admin
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${AppCredentials}:SecretString:DB_PASSWORD}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-orders-db' }
+
+Outputs:
+  DbEndpoint:
+    Description: Replace localhost / db with this in docker-compose.yml or your env files.
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-db-endpoint'
+  DbPort:
+    Value: !GetAtt Database.Endpoint.Port
+  SecretName:
+    Description: The name your services pass to GetSecretValue.
+    Value: !Sub '${ProjectName}/production/credentials'
+  SecretArn:
+    Value: !Ref AppCredentials
+    Export:
+      Name: !Sub '${ProjectName}-db-secret-arn'
+  RdsSecurityGroupId:
+    Value: !Ref RdsSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-rds-sg-id'

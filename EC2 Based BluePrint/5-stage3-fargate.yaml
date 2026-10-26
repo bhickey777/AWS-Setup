@@ -1,0 +1,493 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Deployment week - STAGE 3 (stretch goal): ECS Fargate. ECR repositories, an ECS cluster with a
+  Service Connect namespace, Kafka (KRaft) / auth-service / orders-service as Fargate services,
+  an internet-facing ALB with listeners on 3000 and 8080, and a new RDS ingress rule for the tasks.
+  Requires the Tuesday stack (imports its DB endpoint, secret ARN and RDS security group).
+
+# Two-pass deploy, because Fargate can only pull images that already exist in ECR:
+#
+#   Pass 1 - creates everything, Kafka runs, the two app services start with 0 tasks:
+#     aws cloudformation deploy --stack-name matrix-stage3 \
+#       --template-file 5-stage3-fargate.yaml --capabilities CAPABILITY_NAMED_IAM \
+#       --parameter-overrides VpcId=vpc-xxxx PublicSubnetIds=subnet-aaaa,subnet-bbbb
+#
+#   Push both images (Step 1 of the blueprint; repo URIs are in the stack Outputs).
+#   On Apple Silicon build with  --platform linux/amd64 .
+#
+#   Pass 2 - start the app services:
+#     aws cloudformation deploy --stack-name matrix-stage3 \
+#       --template-file 5-stage3-fargate.yaml --capabilities CAPABILITY_NAMED_IAM \
+#       --parameter-overrides AppDesiredCount=1
+#
+# To roll out a new image with the same tag:
+#   aws ecs update-service --cluster matrix-cluster --service auth-service --force-new-deployment
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: matrix
+    AllowedPattern: '^[a-z][a-z0-9-]{1,19}$'
+    Description: Must match the value used on Monday and Tuesday.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Same VPC as the RDS database.
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two PUBLIC subnets in different AZs (ALB requirement). Tasks run here too.
+
+  AppDesiredCount:
+    Type: Number
+    Default: 0
+    AllowedValues: [0, 1]
+    Description: 0 on the first deploy (images not pushed yet), 1 once both images are in ECR.
+
+  ImageTag:
+    Type: String
+    Default: latest
+
+  KafkaImage:
+    Type: String
+    Default: apache/kafka:latest
+    Description: Pin a specific version (e.g. apache/kafka:3.9.0) for a repeatable demo.
+
+  AuthHealthCheckPath:
+    Type: String
+    Default: /api/auth/health
+
+  OrdersHealthCheckPath:
+    Type: String
+    Default: /api/orders/health
+
+Resources:
+  # ================================================================ Step 1: ECR
+  AuthRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/auth-service'
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EmptyOnDelete: true
+
+  OrdersRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/orders-service'
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EmptyOnDelete: true
+
+  # ================================================================ Step 2: cluster + networking
+  ServiceConnectNamespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Properties:
+      Name: !Sub '${ProjectName}.local'
+      Description: Service Connect namespace - resolves the name "kafka" for the app tasks
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      CapacityProviders: [FARGATE]
+      ServiceConnectDefaults:
+        Namespace: !GetAtt ServiceConnectNamespace.Arn
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-alb-sg'
+      GroupDescription: Public ALB - API ports from anywhere
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, CidrIp: 0.0.0.0/0, Description: Auth API }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0, Description: Orders API }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-alb-sg' }
+
+  TasksSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ecs-tasks-sg'
+      GroupDescription: Fargate tasks - app ports from the ALB only, Kafka from other tasks only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, SourceSecurityGroupId: !Ref AlbSecurityGroup, Description: Auth from ALB }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurityGroup, Description: Orders from ALB }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-ecs-tasks-sg' }
+
+  # Self-reference has to be a separate resource.
+  TasksKafkaIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TasksSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9092
+      ToPort: 9092
+      SourceSecurityGroupId: !Ref TasksSecurityGroup
+      Description: Kafka between tasks
+
+  # Step 2.5: unlock the database for Fargate. The EC2 rule stays until decommissioning.
+  RdsIngressFromTasks:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: '${ProjectName}-rds-sg-id'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref TasksSecurityGroup
+      Description: PostgreSQL from the Fargate tasks
+
+  # ================================================================ Step 3: IAM
+  # Used by ECS itself: pull from ECR, write logs, inject secrets at startup.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}TaskExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: ReadProjectSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/production/*'
+
+  # Used by YOUR code at runtime (e.g. if the Tuesday SDK call is kept as a fallback).
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}TaskRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadProjectSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/production/*'
+
+  # ================================================================ Step 4: logs + task definitions
+  KafkaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/kafka'
+      RetentionInDays: 7
+
+  AuthLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/auth-service'
+      RetentionInDays: 7
+
+  OrdersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}/orders-service'
+      RetentionInDays: 7
+
+  # 4a. Kafka, single-node KRaft. Data is on ephemeral task storage (lost on restart).
+  KafkaTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: kafka
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: kafka
+          Image: !Ref KafkaImage
+          Essential: true
+          PortMappings:
+            - { Name: kafka, ContainerPort: 9092, Protocol: tcp }
+          Environment:
+            - { Name: KAFKA_NODE_ID, Value: '1' }
+            - { Name: KAFKA_PROCESS_ROLES, Value: 'broker,controller' }
+            - { Name: KAFKA_CONTROLLER_QUORUM_VOTERS, Value: '1@localhost:9093' }
+            - { Name: KAFKA_LISTENERS, Value: 'PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093' }
+            # Must be the Service Connect name, not localhost: clients reconnect to this address.
+            - { Name: KAFKA_ADVERTISED_LISTENERS, Value: 'PLAINTEXT://kafka:9092' }
+            - { Name: KAFKA_CONTROLLER_LISTENER_NAMES, Value: CONTROLLER }
+            - { Name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, Value: 'PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT' }
+            - { Name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, Value: '1' }
+            - { Name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, Value: '1' }
+            - { Name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, Value: '1' }
+            - { Name: KAFKA_AUTO_CREATE_TOPICS_ENABLE, Value: 'true' }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref KafkaLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: kafka
+
+  # 4b. Node.js auth service
+  AuthTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: auth-service
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: auth-service
+          Image: !Sub '${AuthRepository.RepositoryUri}:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - { Name: auth, ContainerPort: 3000, Protocol: tcp }
+          # Add any other variables your service reads here.
+          Environment:
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: '${ProjectName}-db-endpoint'
+            - { Name: DB_PORT, Value: '5432' }
+            - { Name: KAFKA_BOOTSTRAP_SERVERS, Value: 'kafka:9092' }
+          # ECS injects these from Secrets Manager; the code just reads env vars.
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${Arn}:DB_PASSWORD::'
+                - Arn: !ImportValue { 'Fn::Sub': '${ProjectName}-db-secret-arn' }
+            - Name: DB_USERNAME
+              ValueFrom: !Sub
+                - '${Arn}:DB_USERNAME::'
+                - Arn: !ImportValue { 'Fn::Sub': '${ProjectName}-db-secret-arn' }
+            - Name: DB_NAME
+              ValueFrom: !Sub
+                - '${Arn}:DB_NAME::'
+                - Arn: !ImportValue { 'Fn::Sub': '${ProjectName}-db-secret-arn' }
+            - Name: JWT_SHARED_SECRET
+              ValueFrom: !Sub
+                - '${Arn}:JWT_SHARED_SECRET::'
+                - Arn: !ImportValue { 'Fn::Sub': '${ProjectName}-db-secret-arn' }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AuthLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: auth
+
+  # 4c. Spring Boot orders service (more memory for the JVM)
+  OrdersTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: orders-service
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: orders-service
+          Image: !Sub '${OrdersRepository.RepositoryUri}:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - { Name: orders, ContainerPort: 8080, Protocol: tcp }
+          Environment:
+            - Name: DB_HOST
+              Value: !ImportValue
+                Fn::Sub: '${ProjectName}-db-endpoint'
+            - { Name: DB_PORT, Value: '5432' }
+            - { Name: KAFKA_BOOTSTRAP_SERVERS, Value: 'kafka:9092' }
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${Arn}:DB_PASSWORD::'
+                - Arn: !ImportValue { 'Fn::Sub': '${ProjectName}-db-secret-arn' }
+            - Name: DB_USERNAME
+              ValueFrom: !Sub
+                - '${Arn}:DB_USERNAME::'
+                - Arn: !ImportValue { 'Fn::Sub': '${ProjectName}-db-secret-arn' }
+            - Name: DB_NAME
+              ValueFrom: !Sub
+                - '${Arn}:DB_NAME::'
+                - Arn: !ImportValue { 'Fn::Sub': '${ProjectName}-db-secret-arn' }
+            - Name: JWT_SHARED_SECRET
+              ValueFrom: !Sub
+                - '${Arn}:JWT_SHARED_SECRET::'
+                - Arn: !ImportValue { 'Fn::Sub': '${ProjectName}-db-secret-arn' }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OrdersLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: orders
+
+  # ================================================================ Step 5: ALB
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  AuthTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-auth-tg'
+      TargetType: ip            # Fargate tasks are IPs, not instances
+      Protocol: HTTP
+      Port: 3000
+      VpcId: !Ref VpcId
+      HealthCheckPath: !Ref AuthHealthCheckPath
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  OrdersTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-orders-tg'
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VpcId
+      HealthCheckPath: !Ref OrdersHealthCheckPath
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+
+  AuthListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 3000
+      Protocol: HTTP
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref AuthTargetGroup }
+
+  OrdersListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref OrdersTargetGroup }
+
+  # ================================================================ Step 6: services
+  KafkaService:
+    Type: AWS::ECS::Service
+    DependsOn: [TasksKafkaIngress]
+    Properties:
+      ServiceName: kafka
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref KafkaTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      # A single broker must never run twice: stop the old task before starting the new one.
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED   # public subnets, no NAT gateway
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups: [!Ref TasksSecurityGroup]
+      ServiceConnectConfiguration:   # client and server
+        Enabled: true
+        Namespace: !GetAtt ServiceConnectNamespace.Arn
+        Services:
+          - PortName: kafka
+            DiscoveryName: kafka
+            ClientAliases:
+              - { DnsName: kafka, Port: 9092 }
+
+  AuthService:
+    Type: AWS::ECS::Service
+    DependsOn: [KafkaService, AuthListener, RdsIngressFromTasks]
+    Properties:
+      ServiceName: auth-service
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref AuthTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref AppDesiredCount
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups: [!Ref TasksSecurityGroup]
+      ServiceConnectConfiguration:   # client side only
+        Enabled: true
+        Namespace: !GetAtt ServiceConnectNamespace.Arn
+      LoadBalancers:
+        - ContainerName: auth-service
+          ContainerPort: 3000
+          TargetGroupArn: !Ref AuthTargetGroup
+
+  OrdersService:
+    Type: AWS::ECS::Service
+    DependsOn: [KafkaService, OrdersListener, RdsIngressFromTasks]
+    Properties:
+      ServiceName: orders-service
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref OrdersTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref AppDesiredCount
+      HealthCheckGracePeriodSeconds: 180   # Spring Boot starts slowly
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups: [!Ref TasksSecurityGroup]
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !GetAtt ServiceConnectNamespace.Arn
+      LoadBalancers:
+        - ContainerName: orders-service
+          ContainerPort: 8080
+          TargetGroupArn: !Ref OrdersTargetGroup
+
+Outputs:
+  AuthRepositoryUri:
+    Value: !GetAtt AuthRepository.RepositoryUri
+  OrdersRepositoryUri:
+    Value: !GetAtt OrdersRepository.RepositoryUri
+  EcrLoginCommand:
+    Value: !Sub 'aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+  AlbDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  AuthApiUrl:
+    Description: Step 7 - new AUTH_API_URL for the Angular environment files.
+    Value: !Sub 'http://${LoadBalancer.DNSName}:3000'
+  OrdersApiUrl:
+    Description: Step 7 - new ORDERS_API_URL for the Angular environment files.
+    Value: !Sub 'http://${LoadBalancer.DNSName}:8080'
+  AuthHealthCheck:
+    Value: !Sub 'curl http://${LoadBalancer.DNSName}:3000${AuthHealthCheckPath}'
+  OrdersHealthCheck:
+    Value: !Sub 'curl http://${LoadBalancer.DNSName}:8080${OrdersHealthCheckPath}'
+  ClusterName:
+    Value: !Ref Cluster

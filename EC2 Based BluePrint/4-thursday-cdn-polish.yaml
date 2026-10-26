@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Deployment week - THURSDAY: Lock & polish. The Wednesday CDN stack plus the SPA refresh fix.
+  Deploy this as an UPDATE of the Wednesday stack (same stack name). Everything is identical
+  to 3-wednesday-cdn.yaml except the CloudFront Function and its two associations, marked
+  "THURSDAY" below.
+
+# Deploy (same stack name as Wednesday):
+#   aws cloudformation deploy --stack-name matrix-cdn --template-file 4-thursday-cdn-polish.yaml
+#
+# Why a CloudFront Function instead of the blueprint's custom error responses:
+#   Error responses are distribution-wide, so a refresh on /admin/dashboard would be answered
+#   with the CLIENT app's /index.html (the default origin), not the Admin app's. The function
+#   below sends Admin routes to /admin/index.html and everything else to /index.html, and it
+#   leaves real files (anything with a dot in the last path segment) untouched so a missing
+#   .js file still shows up as an error instead of silently returning HTML.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: matrix
+    AllowedPattern: '^[a-z][a-z0-9-]{1,19}$'
+
+Resources:
+  ClientUiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-client-ui-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  AdminUiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-admin-ui-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  S3OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-s3-oac'
+        Description: Lets CloudFront sign requests to the private UI buckets
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------- THURSDAY: SPA refresh fix
+  SpaRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${ProjectName}-spa-rewrite'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Serve the right index.html for Angular deep links
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+
+          // Real files (main.js, styles.css, favicon.ico, assets/logo.png) pass straight through.
+          var lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
+          if (lastSegment.indexOf('.') !== -1) {
+            return request;
+          }
+
+          // Anything else is an Angular route: hand it to the right app's index.html.
+          if (uri === '/admin' || uri.indexOf('/admin/') === 0) {
+            request.uri = '/admin/index.html';
+          } else {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName} Client and Admin UIs'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: client-ui-s3
+            DomainName: !GetAtt ClientUiBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt S3OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: admin-ui-s3
+            DomainName: !GetAtt AdminUiBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt S3OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: client-ui-s3
+          ViewerProtocolPolicy: allow-all   # see Wednesday: APIs are plain http
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # CachingOptimized
+          FunctionAssociations:                                   # THURSDAY
+            - EventType: viewer-request
+              FunctionARN: !GetAtt SpaRewriteFunction.FunctionMetadata.FunctionARN
+        CacheBehaviors:
+          - PathPattern: 'admin*'
+            TargetOriginId: admin-ui-s3
+            ViewerProtocolPolicy: allow-all
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            FunctionAssociations:                                 # THURSDAY
+              - EventType: viewer-request
+                FunctionARN: !GetAtt SpaRewriteFunction.FunctionMetadata.FunctionARN
+
+  ClientUiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ClientUiBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontProxyRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${ClientUiBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  AdminUiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AdminUiBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontProxyRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${AdminUiBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+Outputs:
+  SiteUrl:
+    Value: !Sub 'http://${Distribution.DomainName}'
+  AdminUrl:
+    Value: !Sub 'http://${Distribution.DomainName}/admin/'
+  DeepLinkTest:
+    Description: Refresh this in the browser; it should load the Admin app, not an error or the Client app.
+    Value: !Sub 'http://${Distribution.DomainName}/admin/dashboard'
+  DistributionId:
+    Value: !Ref Distribution
+  ClientBucketName:
+    Value: !Ref ClientUiBucket
+  AdminBucketName:
+    Value: !Ref AdminUiBucket
+  InvalidateCacheCommand:
+    Value: !Sub 'aws cloudfront create-invalidation --distribution-id ${Distribution} --paths "/*"'
